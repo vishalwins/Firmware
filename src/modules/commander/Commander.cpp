@@ -95,6 +95,7 @@
 #include <uORB/topics/telemetry_status.h>
 #include <uORB/topics/vehicle_land_detected.h>
 #include <uORB/topics/vtol_vehicle_status.h>
+#include <uORB/topics/esc_status.h>
 
 typedef enum VEHICLE_MODE_FLAG {
 	VEHICLE_MODE_FLAG_CUSTOM_MODE_ENABLED = 1, /* 0b00000001 Reserved for future use. | */
@@ -1198,6 +1199,7 @@ Commander::run()
 	param_t _param_arm_switch_is_button = param_find("COM_ARM_SWISBTN");
 	param_t _param_rc_override = param_find("COM_RC_OVERRIDE");
 	param_t _param_arm_mission_required = param_find("COM_ARM_MIS_REQ");
+	param_t _param_escs_checks_required = param_find("COM_ARM_CHK_ESCS");
 	param_t _param_flight_uuid = param_find("COM_FLIGHT_UUID");
 	param_t _param_takeoff_finished_action = param_find("COM_TAKEOFF_ACT");
 
@@ -1243,6 +1245,7 @@ Commander::run()
 		PX4_ERR("Failed to register power notification callback");
 	}
 
+
 	get_circuit_breaker_params();
 
 	/* armed topic */
@@ -1275,6 +1278,7 @@ Commander::run()
 	uORB::Subscription subsys_sub{ORB_ID(subsystem_info)};
 	uORB::Subscription system_power_sub{ORB_ID(system_power)};
 	uORB::Subscription vtol_vehicle_status_sub{ORB_ID(vtol_vehicle_status)};
+	uORB::Subscription esc_status_sub{ORB_ID(esc_status)};
 
 	geofence_result_s geofence_result {};
 
@@ -1328,6 +1332,10 @@ Commander::run()
 	int32_t arm_mission_required_param = 0;
 	param_get(_param_arm_mission_required, &arm_mission_required_param);
 	arm_requirements |= (arm_mission_required_param & (ARM_REQ_MISSION_BIT | ARM_REQ_ARM_AUTH_BIT));
+
+	int32_t arm_escs_checks_required_param = 0;
+	param_get(_param_escs_checks_required, &arm_escs_checks_required_param);
+	arm_requirements |= (arm_escs_checks_required_param == 0) ? ARM_REQ_NONE : ARM_REQ_ESCS_CHECK_BIT;
 
 	status.rc_input_mode = rc_in_off;
 
@@ -1458,6 +1466,9 @@ Commander::run()
 			arm_requirements = (arm_without_gps_param == 1) ? ARM_REQ_NONE : ARM_REQ_GPS_BIT;
 			param_get(_param_arm_mission_required, &arm_mission_required_param);
 			arm_requirements |= (arm_mission_required_param & (ARM_REQ_MISSION_BIT | ARM_REQ_ARM_AUTH_BIT));
+			param_get(_param_escs_checks_required, &arm_escs_checks_required_param);
+			arm_requirements |= (arm_escs_checks_required_param == 0) ? ARM_REQ_NONE : ARM_REQ_ESCS_CHECK_BIT;
+
 
 			/* flight mode slots */
 			param_get(_param_fmode_1, &_flight_mode_slots[0]);
@@ -1608,6 +1619,14 @@ Commander::run()
 					status_changed = true;
 				}
 			}
+		}
+
+		if (esc_status_sub.updated()) {
+			/* ESCs status changed */
+			esc_status_s esc_status = {};
+
+			esc_status_sub.copy(&esc_status);
+			esc_status_check(esc_status);
 		}
 
 		estimator_check(&status_changed);
@@ -3901,8 +3920,8 @@ void Commander::airspeed_use_check()
 	_airspeed_sub.update();
 	const airspeed_s &airspeed = _airspeed_sub.get();
 
-	_sensor_bias_sub.update();
-	const sensor_bias_s &sensors = _sensor_bias_sub.get();
+	vehicle_acceleration_s accel{};
+	_vehicle_acceleration_sub.copy(&accel);
 
 	bool is_fixed_wing = status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_FIXED_WING;
 
@@ -3988,7 +4007,7 @@ void Commander::airspeed_use_check()
 			float max_lift_ratio = fmaxf(airspeed.indicated_airspeed_m_s, 0.7f) / fmaxf(_airspeed_stall.get(), 1.0f);
 			max_lift_ratio *= max_lift_ratio;
 
-			_load_factor_ratio = 0.95f * _load_factor_ratio + 0.05f * (fabsf(sensors.accel_z) / CONSTANTS_ONE_G) / max_lift_ratio;
+			_load_factor_ratio = 0.95f * _load_factor_ratio + 0.05f * (fabsf(accel.xyz[2]) / CONSTANTS_ONE_G) / max_lift_ratio;
 			_load_factor_ratio = math::constrain(_load_factor_ratio, 0.25f, 2.0f);
 			load_factor_ratio_fail = (_load_factor_ratio > 1.1f);
 			status.load_factor_ratio = _load_factor_ratio;
@@ -4346,4 +4365,40 @@ Commander::offboard_control_update(bool &status_changed)
 		}
 	}
 
+}
+
+void Commander::esc_status_check(const esc_status_s &esc_status)
+{
+	char esc_fail_msg[50];
+	esc_fail_msg[0] = '\0';
+
+	int online_bitmask = (1 << esc_status.esc_count) - 1;
+
+	// Check if ALL the ESCs are online
+	if (online_bitmask == esc_status.esc_online_flags) {
+		status_flags.condition_escs_error = false;
+		_last_esc_online_flags = esc_status.esc_online_flags;
+
+	} else if (_last_esc_online_flags == esc_status.esc_online_flags || esc_status.esc_count == 0)  {
+
+		// Avoid checking the status if the flags are the same or if the mixer has not yet been loaded in the ESC driver
+
+		status_flags.condition_escs_error = true;
+
+	} else if (esc_status.esc_online_flags < _last_esc_online_flags) {
+
+		// Only warn the user when an ESC goes from ONLINE to OFFLINE. This is done to prevent showing Offline ESCs warnings at boot
+
+		for (int index = 0; index < esc_status.esc_count; index++) {
+			if ((esc_status.esc_online_flags & (1 << index)) == 0) {
+				snprintf(esc_fail_msg + strlen(esc_fail_msg), sizeof(esc_fail_msg) - strlen(esc_fail_msg), "ESC%d ", index + 1);
+				esc_fail_msg[sizeof(esc_fail_msg) - 1] = '\0';
+			}
+		}
+
+		mavlink_log_critical(&mavlink_log_pub, "%soffline", esc_fail_msg);
+
+		_last_esc_online_flags = esc_status.esc_online_flags;
+		status_flags.condition_escs_error = true;
+	}
 }

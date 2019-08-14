@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2012-2016 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2019 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -32,69 +32,58 @@
  ****************************************************************************/
 
 /**
- * @file gyro.cpp
+ * @file TrajMath.hpp
  *
- * Driver for the Invensense icm20948 connected via SPI.
- *
- *
- * based on the mpu9250 driver
+ * collection of functions used in trajectory generators
  */
 
-#include "gyro.h"
-#include "icm20948.h"
+#pragma once
 
-ICM20948_gyro::ICM20948_gyro(ICM20948 *parent, const char *path) :
-	CDev("ICM20948_gyro", path),
-	_parent(parent)
+namespace trajmath
 {
+
+/* Compute the maximum possible speed on the track given the remaining distance,
+ * the maximum acceleration and the maximum jerk.
+ * We assume a constant acceleration profile with a delay of 2*accel/jerk
+ * (time to reach the desired acceleration from opposite max acceleration)
+ * Equation to solve: 0 = vel^2 - 2*accel*(x - vel*2*accel/jerk)
+ *
+ * @param jerk maximum jerk
+ * @param accel maximum acceleration
+ * @param braking_distance distance to the desired stopping point
+ *
+ * @return maximum speed
+ */
+template<typename T>
+const T computeMaxSpeedFromBrakingDistance(T jerk, T accel, T braking_distance)
+{
+	T b = (T) 4 * accel * accel / jerk;
+	T c = - (T) 2 * accel * braking_distance;
+	T max_speed = (T) 0.5 * (-b + sqrtf(b * b - (T) 4 * c));
+
+	return max_speed;
 }
 
-ICM20948_gyro::~ICM20948_gyro()
+/* Compute the maximum tangential speed in a circle defined by two line segments of length "d"
+ * forming a V shape, opened by an angle "alpha". The circle is tangent to the end of the
+ * two segments as shown below:
+ *      \\
+ *      | \ d
+ *      /  \
+ *  __='___a\
+ *      d
+ *  @param alpha angle between the two line segments
+ *  @param accel maximum lateral acceleration
+ *  @param d length of the two line segments
+ *
+ *  @return maximum tangential speed
+ */
+template<typename T>
+const T computeMaxSpeedInWaypoint(T alpha, T accel, T d)
 {
-	if (_gyro_class_instance != -1) {
-		unregister_class_devname(GYRO_BASE_DEVICE_PATH, _gyro_class_instance);
-	}
+	T tan_alpha = tan(alpha / (T) 2);
+	T max_speed_in_turn = sqrtf(accel * d * tan_alpha);
+
+	return max_speed_in_turn;
 }
-
-int
-ICM20948_gyro::init()
-{
-	// do base class init
-	int ret = CDev::init();
-
-	/* if probe/setup failed, bail now */
-	if (ret != OK) {
-		DEVICE_DEBUG("gyro init failed");
-		return ret;
-	}
-
-	_gyro_class_instance = register_class_devname(GYRO_BASE_DEVICE_PATH);
-
-	return ret;
-}
-
-void
-ICM20948_gyro::parent_poll_notify()
-{
-	poll_notify(POLLIN);
-}
-
-int
-ICM20948_gyro::ioctl(struct file *filp, int cmd, unsigned long arg)
-{
-	switch (cmd) {
-
-	/* these are shared with the accel side */
-	case SENSORIOCSPOLLRATE:
-	case SENSORIOCRESET:
-		return _parent->_accel->ioctl(filp, cmd, arg);
-
-	case GYROIOCSSCALE:
-		/* copy scale in */
-		memcpy(&_parent->_gyro_scale, (struct gyro_calibration_s *) arg, sizeof(_parent->_gyro_scale));
-		return OK;
-
-	default:
-		return CDev::ioctl(filp, cmd, arg);
-	}
-}
+} /* namespace trajmath */
