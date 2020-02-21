@@ -108,6 +108,12 @@ then
 	teraranger start -a
 fi
 
+# arduino
+if param greater SENS_EN_ARDUINO 1
+then
+	arduino start -a
+fi
+
 ###############################################################################
 #                            End Optional drivers                             #
 ###############################################################################
